@@ -1,0 +1,28 @@
+{
+  "host": "0.0.0.0",
+  "port": 8402,
+  "backend": "cuda",
+  "device": 0,
+  "threads": 1,
+  "lazy_load": true,
+  "models": [
+    {
+      "id": "voxcpm2",
+      "family": "voxcpm2",
+      "path": "/opt/voxcpm2/voxcpm2-q4_k.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "session_options": {
+        "voxcpm2.mem_saver": false,
+        "voxcpm2.audiovae_encoder_sample_capacity": 192000
+      },
+      "default_request_options": {
+        "retry_badcase": false,
+        "num_inference_steps": 4
+      },
+      "default_voice_preset": {
+        "voice_ref": "/opt/voxcpm2/ref_voice.wav"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1047 @@
+--- a/include/engine/framework/runtime/kv_cache.h
++++ b/include/engine/framework/runtime/kv_cache.h
+@@ -39,6 +39,11 @@
+     int64_t ring_pinned_steps = 0;
+     // Device-only users can defer host staging allocation until import_state.
+     bool lazy_import_scratch = false;
++    // When true, import_state writes only the valid prefix rows of each cache
++    // tensor and skips the full-capacity zero fill (f32 caches, non-ring only).
++    // Callers must guarantee rows beyond valid_steps are never consumed
++    // unmasked and that the cache was zeroed once after allocation.
++    bool import_prefix_only = false;
+ };
+ 
+ class TransformerKVCache {
+@@ -58,6 +63,10 @@
+ 
+     void import_state(const TransformerKVState & state);
+     void clear_on_backend();
++    // Resets valid/current counters without touching device memory. Rows
++    // beyond the new valid range keep stale-but-finite values; only safe when
++    // consumers mask positions >= valid_steps (e.g. causal step graphs).
++    void reset_counters();
+     TransformerKVState export_state() const;
+ 
+     void advance_after_direct_append(int64_t steps);
+--- a/src/framework/runtime/kv_cache.cpp
++++ b/src/framework/runtime/kv_cache.cpp
+@@ -132,6 +132,11 @@
+     valid_steps_ = 0;
+ }
+ 
++void TransformerKVCache::reset_counters() {
++    current_end_ = 0;
++    valid_steps_ = 0;
++}
++
+ void TransformerKVCache::import_state(const TransformerKVState & state) {
+     current_end_ = state.current_end;
+     if (layers_.empty()) {
+@@ -146,6 +151,7 @@
+         throw std::runtime_error("TransformerKVCache state valid_steps exceeds cache capacity");
+     }
+     valid_steps_ = state_steps;
++    const bool prefix_only = options_.import_prefix_only && !options_.ring_mode;
+     for (size_t layer = 0; layer < layers_.size(); ++layer) {
+         auto & cache = layers_[layer];
+         const auto & source = state.layers[layer];
+@@ -159,30 +165,48 @@
+         if (source.key.size() != keep_elems) {
+             throw std::runtime_error("TransformerKVCache source tensors do not match valid_steps * step_elems");
+         }
+-        if (cache_steps_ > 0) {
+-            const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
+-            cache.import_key_scratch.resize(cache_elems);
+-            cache.import_value_scratch.resize(cache_elems);
+-            std::fill(cache.import_key_scratch.begin(), cache.import_key_scratch.end(), 0.0F);
+-            std::fill(cache.import_value_scratch.begin(), cache.import_value_scratch.end(), 0.0F);
+-            if (keep_elems > 0) {
+-                if (!options_.ring_mode) {
+-                    std::copy(source.key.begin(), source.key.end(), cache.import_key_scratch.begin());
+-                    std::copy(source.value.begin(), source.value.end(), cache.import_value_scratch.begin());
+-                } else {
+-                    for (int64_t row = 0; row < state_steps; ++row) {
+-                        const int64_t position = ring_stored_position(
+-                            row, state_steps, current_end_, options_.ring_pinned_steps);
+-                        copy_cache_row(
+-                            source.key, row, cache.import_key_scratch, slot_for_position(position), step_elems_);
+-                        copy_cache_row(
+-                            source.value, row, cache.import_value_scratch, slot_for_position(position), step_elems_);
+-                    }
++        if (cache_steps_ <= 0) {
++            continue;
++        }
++        if (prefix_only) {
++            // Prefix rows are contiguous floats at offset 0 in the cache
++            // tensors ({1, cache_steps, heads, dim} dense layout).
++            if (keep_elems == 0) {
++                continue;
++            }
++            if (cache.key_tensor.type != GGML_TYPE_F32 ||
++                cache.value_tensor.type != GGML_TYPE_F32) {
++                throw std::runtime_error(
++                    "TransformerKVCache import_prefix_only requires f32 cache tensors");
++            }
++            ggml_backend_tensor_set(cache.key_tensor.tensor, source.key.data(), 0,
++                                    keep_elems * sizeof(float));
++            ggml_backend_tensor_set(cache.value_tensor.tensor, source.value.data(), 0,
++                                    keep_elems * sizeof(float));
++            continue;
++        }
++        const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
++        cache.import_key_scratch.resize(cache_elems);
++        cache.import_value_scratch.resize(cache_elems);
++        std::fill(cache.import_key_scratch.begin(), cache.import_key_scratch.end(), 0.0F);
++        std::fill(cache.import_value_scratch.begin(), cache.import_value_scratch.end(), 0.0F);
++        if (keep_elems > 0) {
++            if (!options_.ring_mode) {
++                std::copy(source.key.begin(), source.key.end(), cache.import_key_scratch.begin());
++                std::copy(source.value.begin(), source.value.end(), cache.import_value_scratch.begin());
++            } else {
++                for (int64_t row = 0; row < state_steps; ++row) {
++                    const int64_t position = ring_stored_position(
++                        row, state_steps, current_end_, options_.ring_pinned_steps);
++                    copy_cache_row(
++                        source.key, row, cache.import_key_scratch, slot_for_position(position), step_elems_);
++                    copy_cache_row(
++                        source.value, row, cache.import_value_scratch, slot_for_position(position), step_elems_);
+                 }
+             }
+-            write_cache_tensor(cache.key_tensor, cache.import_key_scratch, options_);
+-            write_cache_tensor(cache.value_tensor, cache.import_value_scratch, options_);
+         }
++        write_cache_tensor(cache.key_tensor, cache.import_key_scratch, options_);
++        write_cache_tensor(cache.value_tensor, cache.import_value_scratch, options_);
+     }
+ }
+ 
+--- a/include/engine/models/voxcpm2/minicpm.h
++++ b/include/engine/models/voxcpm2/minicpm.h
+@@ -135,6 +135,9 @@
+   ~VoxCPM2TextEmbeddingRuntime();
+ 
+   std::vector<float> embed_token(int32_t token_id);
++  // Batched embedding lookup: one graph compute for all ids. Returns
++  // token_ids.size() * hidden_size floats in row order.
++  std::vector<float> embed_tokens(const std::vector<int32_t> &token_ids);
+ 
+ private:
+   class Impl;
+@@ -165,6 +168,12 @@
+   ~VoxCPM2MiniCPMStepRuntime();
+ 
+   void reset();
++  // Rebuilds the step graph with a larger KV capacity when `required_steps`
++  // exceeds the current capacity (rounded up to reduce rebuild frequency).
++  // Never exceeds the max_cache_steps passed to the constructor. Small
++  // requests therefore pay attention over their real length, not max_length.
++  void ensure_capacity(int64_t required_steps);
++  int64_t cache_capacity() const;
+   void import_state(const engine::runtime::TransformerKVState &state);
+   engine::runtime::TransformerKVState export_state() const;
+   VoxCPM2MiniCPMStepOutput run_step(const std::vector<float> &embedding);
+--- a/src/models/voxcpm2/minicpm.cpp
++++ b/src/models/voxcpm2/minicpm.cpp
+@@ -329,7 +329,8 @@
+ public:
+   Impl(std::shared_ptr<const VoxCPM2WeightsRuntime> weights,
+        size_t graph_context_bytes, bool mem_saver)
+-      : weights_(std::move(weights)), mem_saver_(mem_saver) {
++      : weights_(std::move(weights)), graph_context_bytes_(graph_context_bytes),
++        mem_saver_(mem_saver) {
+     if (weights_ == nullptr) {
+       throw std::runtime_error(
+           "VoxCPM2 text embedding runtime requires weights");
+@@ -345,6 +346,16 @@
+     if (gallocr_ != nullptr) {
+       ggml_gallocr_free(gallocr_);
+     }
++    if (batch_graph_ != nullptr) {
++      engine::core::release_backend_graph_resources(weights_->backend(),
++                                                    batch_graph_);
++    }
++    if (batch_buffer_ != nullptr) {
++      ggml_backend_buffer_free(batch_buffer_);
++    }
++    if (batch_gallocr_ != nullptr) {
++      ggml_gallocr_free(batch_gallocr_);
++    }
+   }
+ 
+   std::vector<float> embed_token(int32_t token_id) {
+@@ -367,6 +378,43 @@
+     return output;
+   }
+ 
++  std::vector<float> embed_tokens(const std::vector<int32_t> &token_ids) {
++    const auto &config = weights_->assets().config.lm;
++    if (token_ids.empty()) {
++      return {};
++    }
++    for (const int32_t token_id : token_ids) {
++      if (token_id < 0 || token_id >= config.vocab_size) {
++        throw std::runtime_error(
++            "VoxCPM2 text embedding token id is out of range");
++      }
++    }
++    const int64_t bucket =
++        ((static_cast<int64_t>(token_ids.size()) + 15) / 16) * 16;
++    if (bucket != batch_bucket_) {
++      build_batch(bucket);
++    }
++    std::vector<int32_t> padded(static_cast<size_t>(bucket), token_ids.front());
++    std::copy(token_ids.begin(), token_ids.end(), padded.begin());
++    ggml_backend_tensor_set(batch_token_ids_, padded.data(), 0,
++                            padded.size() * sizeof(int32_t));
++    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
++    const ggml_status status =
++        engine::core::compute_backend_graph(weights_->backend(), batch_graph_);
++    ggml_backend_synchronize(weights_->backend());
++    if (status != GGML_STATUS_SUCCESS) {
++      throw std::runtime_error("VoxCPM2 batched text embedding graph compute failed");
++    }
++    std::vector<float> output(token_ids.size() *
++                                  static_cast<size_t>(config.hidden_size),
++                              0.0F);
++    // Output rows are contiguous {bucket, hidden}: the wanted rows are the
++    // leading token_ids.size() rows.
++    ggml_backend_tensor_get(batch_output_, output.data(), 0,
++                            output.size() * sizeof(float));
++    return output;
++  }
++
+ private:
+   void build(size_t graph_context_bytes) {
+     const auto &config = weights_->assets().config.lm;
+@@ -428,7 +476,85 @@
+     }
+   }
+ 
++  // Batched variant of the embedding graph: one get_rows over `bucket` token
++  // ids per compute. Rebuilt when the bucket (multiple of 16) changes.
++  void build_batch(int64_t bucket) {
++    const auto &config = weights_->assets().config.lm;
++    if (batch_graph_ != nullptr) {
++      engine::core::release_backend_graph_resources(weights_->backend(),
++                                                    batch_graph_);
++      batch_graph_ = nullptr;
++    }
++    if (batch_buffer_ != nullptr) {
++      ggml_backend_buffer_free(batch_buffer_);
++      batch_buffer_ = nullptr;
++    }
++    if (batch_gallocr_ != nullptr) {
++      ggml_gallocr_free(batch_gallocr_);
++      batch_gallocr_ = nullptr;
++    }
++    batch_ctx_.reset();
++    batch_token_ids_ = nullptr;
++    batch_output_ = nullptr;
++    batch_bucket_ = 0;
++
++    ggml_init_params params{graph_context_bytes_, nullptr, true};
++    batch_ctx_.reset(ggml_init(params));
++    if (batch_ctx_ == nullptr) {
++      throw std::runtime_error(
++          "failed to initialize VoxCPM2 batched text embedding graph context");
++    }
++    engine::core::ModuleBuildContext ctx{batch_ctx_.get(),
++                                         "voxcpm2.text_embedding.batch"};
++    batch_token_ids_ = ggml_new_tensor_1d(batch_ctx_.get(), GGML_TYPE_I32, bucket);
++    if (mem_saver_) {
++      ggml_set_input(batch_token_ids_);
++    }
++    auto tokens =
++        engine::core::wrap_tensor(batch_token_ids_,
++                                  engine::core::TensorShape::from_dims({bucket}),
++                                  GGML_TYPE_I32);
++    auto embedding =
++        engine::modules::EmbeddingModule(
++            {config.vocab_size, config.hidden_size})
++            .build(ctx, tokens, *weights_->weights().base_lm.token_embedding);
++    const float scale =
++        config.use_mup ? static_cast<float>(config.scale_emb) : 1.0F;
++    embedding = scale_tensor(ctx, embedding, scale);
++    embedding = ensure_contiguous(ctx, embedding);
++    batch_output_ = embedding.tensor;
++    ggml_set_output(batch_output_);
++    if (mem_saver_ && batch_output_->view_src != nullptr) {
++      ggml_set_output(batch_output_->view_src);
++    }
++    batch_graph_ = ggml_new_graph_custom(batch_ctx_.get(), kDefaultGraphNodes, false);
++    ggml_build_forward_expand(batch_graph_, batch_output_);
++    if (mem_saver_) {
++      batch_gallocr_ = ggml_gallocr_new(
++          ggml_backend_get_default_buffer_type(weights_->backend()));
++      if (batch_gallocr_ == nullptr ||
++          !ggml_gallocr_reserve(batch_gallocr_, batch_graph_) ||
++          !ggml_gallocr_alloc_graph(batch_gallocr_, batch_graph_)) {
++        if (batch_gallocr_ != nullptr) {
++          ggml_gallocr_free(batch_gallocr_);
++          batch_gallocr_ = nullptr;
++        }
++        throw std::runtime_error(
++            "failed to allocate VoxCPM2 batched text embedding graph");
++      }
++    } else {
++      batch_buffer_ =
++          ggml_backend_alloc_ctx_tensors(batch_ctx_.get(), weights_->backend());
++      if (batch_buffer_ == nullptr) {
++        throw std::runtime_error(
++            "failed to allocate VoxCPM2 batched text embedding graph");
++      }
++    }
++    batch_bucket_ = bucket;
++  }
++
+   std::shared_ptr<const VoxCPM2WeightsRuntime> weights_;
++  size_t graph_context_bytes_ = 0;
+   bool mem_saver_ = false;
+   std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+   ggml_tensor *token_id_ = nullptr;
+@@ -436,6 +562,13 @@
+   ggml_cgraph *graph_ = nullptr;
+   ggml_backend_buffer_t buffer_ = nullptr;
+   ggml_gallocr_t gallocr_ = nullptr;
++  std::unique_ptr<ggml_context, GgmlContextDeleter> batch_ctx_;
++  ggml_tensor *batch_token_ids_ = nullptr;
++  ggml_tensor *batch_output_ = nullptr;
++  ggml_cgraph *batch_graph_ = nullptr;
++  ggml_backend_buffer_t batch_buffer_ = nullptr;
++  ggml_gallocr_t batch_gallocr_ = nullptr;
++  int64_t batch_bucket_ = 0;
+ };
+ 
+ VoxCPM2TextEmbeddingRuntime::VoxCPM2TextEmbeddingRuntime(
+@@ -450,6 +583,11 @@
+   return impl_->embed_token(token_id);
+ }
+ 
++std::vector<float>
++VoxCPM2TextEmbeddingRuntime::embed_tokens(const std::vector<int32_t> &token_ids) {
++  return impl_->embed_tokens(token_ids);
++}
++
+ struct MiniCPMLayerWithCacheOutput {
+   engine::core::TensorValue output;
+   engine::core::TensorValue key;
+@@ -994,13 +1132,20 @@
+ class VoxCPM2MiniCPMStepRuntime::Impl {
+ public:
+   Impl(std::shared_ptr<const VoxCPM2WeightsRuntime> weights,
+-       VoxCPM2MiniCPMKind kind, int64_t cache_steps, size_t graph_context_bytes)
+-      : weights_(std::move(weights)), kind_(kind), cache_steps_(cache_steps),
++       VoxCPM2MiniCPMKind kind, int64_t max_cache_steps, size_t graph_context_bytes)
++      : weights_(std::move(weights)), kind_(kind),
++        max_cache_steps_(max_cache_steps),
+         graph_context_bytes_(graph_context_bytes) {
+     if (weights_ == nullptr) {
+       throw std::runtime_error("VoxCPM2 MiniCPM step runtime requires weights");
+     }
+-    build(graph_context_bytes);
++    if (max_cache_steps_ <= 0) {
++      throw std::runtime_error(
++          "VoxCPM2 MiniCPM step graph requires positive cache capacity");
++    }
++    // Start small: ensure_capacity grows the graph to each request's real
++    // need, so short requests never pay max_length-sized attention.
++    build(initial_capacity());
+   }
+ 
+   ~Impl() {
+@@ -1009,13 +1154,39 @@
+ 
+   void reset() {
+     ensure_graph();
+-    engine::runtime::TransformerKVState state;
+-    state.current_end = 0;
+-    state.layers.resize(
+-        select_minicpm_weights(weights_->weights(), kind_).layers.size());
+-    step_cache_.import_state(state);
++    // Counter-only reset: the caches were zeroed once at build time, rows
++    // written by earlier requests are finite, and the attention mask in
++    // run_step masks every position beyond valid_steps — so no device writes
++    // (previously a full-capacity zero fill + upload per request) are needed.
++    step_cache_.reset_counters();
++  }
++
++  static int64_t round_capacity(int64_t steps) {
++    constexpr int64_t kGranule = 256;
++    return ((steps + kGranule - 1) / kGranule) * kGranule;
++  }
++
++  int64_t initial_capacity() const {
++    return std::min(max_cache_steps_, round_capacity(1));
+   }
+ 
++  void ensure_capacity(int64_t required_steps) {
++    if (required_steps <= 0) {
++      throw std::runtime_error(
++          "VoxCPM2 MiniCPM step capacity request must be positive");
++    }
++    if (required_steps > max_cache_steps_) {
++      throw std::runtime_error(
++          "VoxCPM2 MiniCPM step capacity request exceeds the model cache length");
++    }
++    const int64_t want = std::min(max_cache_steps_, round_capacity(required_steps));
++    if (graph_ == nullptr || want > capacity_) {
++      build(want);
++    }
++  }
++
++  int64_t capacity() const noexcept { return capacity_; }
++
+   void import_state(const engine::runtime::TransformerKVState &state) {
+     ensure_graph();
+     step_cache_.import_state(state);
+@@ -1032,7 +1203,7 @@
+     if (static_cast<int64_t>(embedding.size()) != config.hidden_size) {
+       throw std::runtime_error("VoxCPM2 MiniCPM step embedding size mismatch");
+     }
+-    if (step_cache_.valid_steps() >= cache_steps_) {
++    if (step_cache_.valid_steps() >= capacity_) {
+       throw std::runtime_error("VoxCPM2 MiniCPM step exceeds cache capacity");
+     }
+     ggml_backend_tensor_set(input_, embedding.data(), 0,
+@@ -1074,7 +1245,7 @@
+ private:
+   void ensure_graph() {
+     if (graph_ == nullptr) {
+-      build(graph_context_bytes_);
++      build(capacity_ > 0 ? capacity_ : initial_capacity());
+     }
+   }
+ 
+@@ -1097,17 +1268,17 @@
+     ctx_.reset();
+   }
+ 
+-  void build(size_t graph_context_bytes) {
+-    if (cache_steps_ <= 0) {
++  void build(int64_t cache_steps) {
++    if (cache_steps <= 0) {
+       throw std::runtime_error(
+           "VoxCPM2 MiniCPM step graph requires positive cache capacity");
+     }
+-    if (graph_context_bytes == 0) {
++    if (graph_context_bytes_ == 0) {
+       throw std::runtime_error(
+           "VoxCPM2 MiniCPM step graph context bytes must be non-zero");
+     }
+     release_graph();
+-    ggml_init_params params{graph_context_bytes, nullptr, true};
++    ggml_init_params params{graph_context_bytes_, nullptr, true};
+     ctx_.reset(ggml_init(params));
+     if (ctx_ == nullptr) {
+       throw std::runtime_error(
+@@ -1130,10 +1301,10 @@
+     auto cache_slot = engine::core::wrap_tensor(
+         cache_slot_, engine::core::TensorShape::from_dims({1}), GGML_TYPE_I32);
+     attention_mask_ =
+-        ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, cache_steps_, 1, 1, 1);
++        ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, cache_steps, 1, 1, 1);
+     auto attention_mask = engine::core::wrap_tensor(
+         attention_mask_,
+-        engine::core::TensorShape::from_dims({1, 1, 1, cache_steps_}),
++        engine::core::TensorShape::from_dims({1, 1, 1, cache_steps}),
+         GGML_TYPE_F16);
+ 
+     std::vector<engine::core::TensorValue> cache_keys;
+@@ -1144,18 +1315,23 @@
+       cache_keys.push_back(engine::core::make_tensor(
+           ctx, GGML_TYPE_F32,
+           engine::core::TensorShape::from_dims(
+-              {1, cache_steps_, config.num_key_value_heads, dim})));
++              {1, cache_steps, config.num_key_value_heads, dim})));
+       cache_values.push_back(engine::core::make_tensor(
+           ctx, GGML_TYPE_F32,
+           engine::core::TensorShape::from_dims(
+-              {1, cache_steps_, config.num_key_value_heads, dim})));
++              {1, cache_steps, config.num_key_value_heads, dim})));
+       x = minicpm_layer_with_static_cache(
+           ctx, x, position, cache_slot, attention_mask, cache_keys.back(),
+           cache_values.back(), layer, lm_weights);
+     }
++    engine::runtime::TransformerKVCacheOptions cache_options;
++    // Per-request imports write only the valid prefix rows; the caches are
++    // zeroed once at build time below, and run_step's mask keeps every
++    // position beyond valid_steps out of the attention result.
++    cache_options.import_prefix_only = true;
+     step_cache_ = engine::runtime::TransformerKVCache(
+-        cache_steps_, config.num_key_value_heads * dim, std::move(cache_keys),
+-        std::move(cache_values));
++        cache_steps, config.num_key_value_heads * dim, std::move(cache_keys),
++        std::move(cache_values), cache_options);
+     x = engine::modules::RMSNormModule(
+             {config.hidden_size, config.rms_norm_eps, true, false})
+             .build(ctx, x, lm_weights.norm);
+@@ -1167,13 +1343,18 @@
+     if (buffer_ == nullptr) {
+       throw std::runtime_error("failed to allocate VoxCPM2 MiniCPM step graph");
+     }
+-    attention_mask_buffer_.assign(static_cast<size_t>(cache_steps_),
++    // One full zero-fill at build time; afterwards reset() is counters-only
++    // and import_state writes just the valid prefix.
++    step_cache_.clear_on_backend();
++    attention_mask_buffer_.assign(static_cast<size_t>(cache_steps),
+                                   ggml_fp32_to_fp16(-INFINITY));
++    capacity_ = cache_steps;
+   }
+ 
+   std::shared_ptr<const VoxCPM2WeightsRuntime> weights_;
+   VoxCPM2MiniCPMKind kind_ = VoxCPM2MiniCPMKind::BaseLM;
+-  int64_t cache_steps_ = 0;
++  int64_t max_cache_steps_ = 0;
++  int64_t capacity_ = 0;
+   size_t graph_context_bytes_ = 0;
+   std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+   ggml_tensor *input_ = nullptr;
+@@ -1197,6 +1378,14 @@
+ 
+ void VoxCPM2MiniCPMStepRuntime::reset() { impl_->reset(); }
+ 
++void VoxCPM2MiniCPMStepRuntime::ensure_capacity(int64_t required_steps) {
++  impl_->ensure_capacity(required_steps);
++}
++
++int64_t VoxCPM2MiniCPMStepRuntime::cache_capacity() const {
++  return impl_->capacity();
++}
++
+ void VoxCPM2MiniCPMStepRuntime::import_state(
+     const engine::runtime::TransformerKVState &state) {
+   impl_->import_state(state);
+--- a/src/models/voxcpm2/generator.cpp
++++ b/src/models/voxcpm2/generator.cpp
+@@ -189,6 +189,21 @@
+   std::vector<float> fsq_stop_logits;
+ };
+ 
++// Subset of the projection outputs needed to advance the LM state between
++// tokens (the DiT/stop branches are only needed once per emitted patch).
++struct VoxCPM2StepAdvanceOutput {
++  std::vector<float> fsq_hidden;
++  std::vector<float> residual_input;
++};
++
++// Subset needed once per emitted patch (DiT conditioning + stop logits);
++// the FSQ/fusion branches belong to the token advance.
++struct VoxCPM2StepEmitOutput {
++  std::vector<float> current_lm_dit_hidden;
++  std::vector<float> residual_dit_hidden;
++  std::vector<float> current_stop_logits;
++};
++
+ class VoxCPM2StepProjectionRuntime final {
+ public:
+   VoxCPM2StepProjectionRuntime(
+@@ -199,6 +214,14 @@
+   VoxCPM2StepProjectionOutput run(const std::vector<float> &lm_hidden,
+                                   const std::vector<float> &residual_hidden,
+                                   const std::vector<float> &current_embed);
++  // Computes only fsq_hidden + residual_input (2 downloads instead of 8,
++  // skipping the DiT/stop branches of the graph).
++  VoxCPM2StepAdvanceOutput run_advance(const std::vector<float> &lm_hidden,
++                                       const std::vector<float> &current_embed);
++  // Computes only the DiT conditioning + stop logits (3 downloads instead of
++  // 8, skipping the FSQ/fusion branches).
++  VoxCPM2StepEmitOutput run_emit(const std::vector<float> &lm_hidden,
++                                 const std::vector<float> &residual_hidden);
+ 
+ private:
+   class Impl;
+@@ -232,6 +255,13 @@
+                          const std::vector<float> &cond,
+                          const std::vector<float> &time_embedding,
+                          const std::vector<float> &delta_time_embedding);
++  // mu/cond are constant across the diffusion steps of one patch; upload them
++  // once, then call run_step per diffusion step.
++  void set_conditioning(const std::vector<float> &mu,
++                        const std::vector<float> &cond);
++  std::vector<float> run_step(const std::vector<float> &x,
++                              const std::vector<float> &time_embedding,
++                              const std::vector<float> &delta_time_embedding);
+ 
+ private:
+   class Impl;
+@@ -272,6 +302,14 @@
+ 
+   ~Impl() {
+     engine::core::release_backend_graph_resources(weights_->backend(), graph_);
++    if (advance_graph_ != nullptr) {
++      engine::core::release_backend_graph_resources(weights_->backend(),
++                                                    advance_graph_);
++    }
++    if (emit_graph_ != nullptr) {
++      engine::core::release_backend_graph_resources(weights_->backend(),
++                                                    emit_graph_);
++    }
+     if (buffer_ != nullptr) {
+       ggml_backend_buffer_free(buffer_);
+     }
+@@ -348,6 +386,79 @@
+     return output;
+   }
+ 
++  VoxCPM2StepAdvanceOutput run_advance(const std::vector<float> &lm_hidden,
++                                       const std::vector<float> &current_embed) {
++    const auto &config = weights_->assets().config;
++    if (static_cast<int64_t>(lm_hidden.size()) != config.lm.hidden_size) {
++      throw std::runtime_error(
++          "VoxCPM2 step advance lm_hidden size mismatch");
++    }
++    if (static_cast<int64_t>(current_embed.size()) != config.lm.hidden_size) {
++      throw std::runtime_error(
++          "VoxCPM2 step advance current_embed size mismatch");
++    }
++    ggml_backend_tensor_set(lm_hidden_, lm_hidden.data(), 0,
++                            lm_hidden.size() * sizeof(float));
++    ggml_backend_tensor_set(current_embed_, current_embed.data(), 0,
++                            current_embed.size() * sizeof(float));
++    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
++    const ggml_status status =
++        engine::core::compute_backend_graph(weights_->backend(), advance_graph_);
++    ggml_backend_synchronize(weights_->backend());
++    if (status != GGML_STATUS_SUCCESS) {
++      throw std::runtime_error("VoxCPM2 step advance graph compute failed");
++    }
++    VoxCPM2StepAdvanceOutput output;
++    output.fsq_hidden.resize(static_cast<size_t>(config.lm.hidden_size), 0.0F);
++    output.residual_input.resize(static_cast<size_t>(config.lm.hidden_size),
++                                 0.0F);
++    ggml_backend_tensor_get(fsq_hidden_output_, output.fsq_hidden.data(), 0,
++                            output.fsq_hidden.size() * sizeof(float));
++    ggml_backend_tensor_get(residual_input_output_,
++                            output.residual_input.data(), 0,
++                            output.residual_input.size() * sizeof(float));
++    return output;
++  }
++
++  VoxCPM2StepEmitOutput run_emit(const std::vector<float> &lm_hidden,
++                                 const std::vector<float> &residual_hidden) {
++    const auto &config = weights_->assets().config;
++    if (static_cast<int64_t>(lm_hidden.size()) != config.lm.hidden_size) {
++      throw std::runtime_error("VoxCPM2 step emit lm_hidden size mismatch");
++    }
++    if (static_cast<int64_t>(residual_hidden.size()) != config.lm.hidden_size) {
++      throw std::runtime_error(
++          "VoxCPM2 step emit residual_hidden size mismatch");
++    }
++    ggml_backend_tensor_set(lm_hidden_, lm_hidden.data(), 0,
++                            lm_hidden.size() * sizeof(float));
++    ggml_backend_tensor_set(residual_hidden_, residual_hidden.data(), 0,
++                            residual_hidden.size() * sizeof(float));
++    engine::core::set_backend_threads(weights_->backend(), weights_->threads());
++    const ggml_status status =
++        engine::core::compute_backend_graph(weights_->backend(), emit_graph_);
++    ggml_backend_synchronize(weights_->backend());
++    if (status != GGML_STATUS_SUCCESS) {
++      throw std::runtime_error("VoxCPM2 step emit graph compute failed");
++    }
++    VoxCPM2StepEmitOutput output;
++    output.current_lm_dit_hidden.resize(
++        static_cast<size_t>(config.dit.hidden_dim), 0.0F);
++    output.residual_dit_hidden.resize(
++        static_cast<size_t>(config.dit.hidden_dim), 0.0F);
++    output.current_stop_logits.resize(2, 0.0F);
++    ggml_backend_tensor_get(current_lm_dit_output_,
++                            output.current_lm_dit_hidden.data(), 0,
++                            output.current_lm_dit_hidden.size() * sizeof(float));
++    ggml_backend_tensor_get(residual_dit_output_,
++                            output.residual_dit_hidden.data(), 0,
++                            output.residual_dit_hidden.size() * sizeof(float));
++    ggml_backend_tensor_get(current_stop_logits_output_,
++                            output.current_stop_logits.data(), 0,
++                            output.current_stop_logits.size() * sizeof(float));
++    return output;
++  }
++
+ private:
+   void build(size_t graph_context_bytes) {
+     const auto &config = weights_->assets().config;
+@@ -506,6 +617,17 @@
+     ggml_build_forward_expand(graph_, residual_dit_output_);
+     ggml_build_forward_expand(graph_, current_stop_logits_output_);
+     ggml_build_forward_expand(graph_, fsq_stop_logits_output_);
++    // Subset graph for the between-token advance: expands only the FSQ and
++    // fusion chains from the same tensors, so the full graph's allocation
++    // (either path below) covers it.
++    advance_graph_ = ggml_new_graph_custom(ctx_.get(), kDefaultGraphNodes, false);
++    ggml_build_forward_expand(advance_graph_, fsq_hidden_output_);
++    ggml_build_forward_expand(advance_graph_, residual_input_output_);
++    // Subset graph for per-patch emission: DiT conditioning + stop logits.
++    emit_graph_ = ggml_new_graph_custom(ctx_.get(), kDefaultGraphNodes, false);
++    ggml_build_forward_expand(emit_graph_, current_lm_dit_output_);
++    ggml_build_forward_expand(emit_graph_, residual_dit_output_);
++    ggml_build_forward_expand(emit_graph_, current_stop_logits_output_);
+     if (mem_saver_) {
+       gallocr_ = ggml_gallocr_new(
+           ggml_backend_get_default_buffer_type(weights_->backend()));
+@@ -542,6 +664,8 @@
+   ggml_tensor *current_stop_logits_output_ = nullptr;
+   ggml_tensor *fsq_stop_logits_output_ = nullptr;
+   ggml_cgraph *graph_ = nullptr;
++  ggml_cgraph *advance_graph_ = nullptr;
++  ggml_cgraph *emit_graph_ = nullptr;
+   ggml_backend_buffer_t buffer_ = nullptr;
+   ggml_gallocr_t gallocr_ = nullptr;
+ };
+@@ -561,6 +685,18 @@
+   return impl_->run(lm_hidden, residual_hidden, current_embed);
+ }
+ 
++VoxCPM2StepAdvanceOutput
++VoxCPM2StepProjectionRuntime::run_advance(const std::vector<float> &lm_hidden,
++                                          const std::vector<float> &current_embed) {
++  return impl_->run_advance(lm_hidden, current_embed);
++}
++
++VoxCPM2StepEmitOutput
++VoxCPM2StepProjectionRuntime::run_emit(const std::vector<float> &lm_hidden,
++                                       const std::vector<float> &residual_hidden) {
++  return impl_->run_emit(lm_hidden, residual_hidden);
++}
++
+ class VoxCPM2LocalEncoderRuntime::Impl {
+ public:
+   Impl(std::shared_ptr<const VoxCPM2WeightsRuntime> weights,
+@@ -743,17 +879,32 @@
+                          const std::vector<float> &cond,
+                          const std::vector<float> &time_embedding,
+                          const std::vector<float> &delta_time_embedding) {
++    set_conditioning(mu, cond);
++    return run_step(x, time_embedding, delta_time_embedding);
++  }
++
++  void set_conditioning(const std::vector<float> &mu,
++                        const std::vector<float> &cond) {
+     const auto &config = weights_->assets().config;
+     const int64_t patch_elems = 2 * config.feat_dim * config.patch_size;
+-    if (static_cast<int64_t>(x.size()) != patch_elems) {
+-      throw std::runtime_error("VoxCPM2 DiT estimator x size mismatch");
+-    }
+     if (static_cast<int64_t>(cond.size()) != patch_elems) {
+       throw std::runtime_error("VoxCPM2 DiT estimator cond size mismatch");
+     }
+     if (static_cast<int64_t>(mu.size()) != 2 * config.dit.hidden_dim * 2) {
+       throw std::runtime_error("VoxCPM2 DiT estimator mu size mismatch");
+     }
++    ggml_backend_tensor_set(cond_, cond.data(), 0, cond.size() * sizeof(float));
++    ggml_backend_tensor_set(mu_, mu.data(), 0, mu.size() * sizeof(float));
++  }
++
++  std::vector<float> run_step(const std::vector<float> &x,
++                              const std::vector<float> &time_embedding,
++                              const std::vector<float> &delta_time_embedding) {
++    const auto &config = weights_->assets().config;
++    const int64_t patch_elems = 2 * config.feat_dim * config.patch_size;
++    if (static_cast<int64_t>(x.size()) != patch_elems) {
++      throw std::runtime_error("VoxCPM2 DiT estimator x size mismatch");
++    }
+     if (static_cast<int64_t>(time_embedding.size()) !=
+         2 * config.dit.hidden_dim) {
+       throw std::runtime_error(
+@@ -765,8 +916,6 @@
+           "VoxCPM2 DiT estimator delta-time embedding size mismatch");
+     }
+     ggml_backend_tensor_set(x_, x.data(), 0, x.size() * sizeof(float));
+-    ggml_backend_tensor_set(cond_, cond.data(), 0, cond.size() * sizeof(float));
+-    ggml_backend_tensor_set(mu_, mu.data(), 0, mu.size() * sizeof(float));
+     ggml_backend_tensor_set(time_embedding_, time_embedding.data(), 0,
+                             time_embedding.size() * sizeof(float));
+     ggml_backend_tensor_set(delta_time_embedding_, delta_time_embedding.data(),
+@@ -987,6 +1136,17 @@
+   return impl_->run(x, mu, cond, time_embedding, delta_time_embedding);
+ }
+ 
++void VoxCPM2DiTEstimatorRuntime::set_conditioning(
++    const std::vector<float> &mu, const std::vector<float> &cond) {
++  impl_->set_conditioning(mu, cond);
++}
++
++std::vector<float> VoxCPM2DiTEstimatorRuntime::run_step(
++    const std::vector<float> &x, const std::vector<float> &time_embedding,
++    const std::vector<float> &delta_time_embedding) {
++  return impl_->run_step(x, time_embedding, delta_time_embedding);
++}
++
+ 
+ std::vector<float> sinusoidal_time_embedding(float timestep,
+                                              int64_t hidden_size) {
+@@ -1072,45 +1232,21 @@
+     std::copy(cond.begin(), cond.end(),
+               cond_in.begin() + static_cast<std::ptrdiff_t>(patch_elems));
+ 
+-    std::vector<float> t_span(static_cast<size_t>(timesteps + 1), 0.0F);
+-    constexpr double kHalfPi = 1.57079632679489661923;
+-    for (int64_t i = 0; i <= timesteps; ++i) {
+-      const double base =
+-          1.0 - static_cast<double>(i) / static_cast<double>(timesteps);
+-      t_span[static_cast<size_t>(i)] =
+-          static_cast<float>(base + (std::cos(kHalfPi * base) - 1.0 + base));
+-    }
+-
+-    float t = t_span.front();
+-    float dt = t_span[0] - t_span[1];
+-    const int64_t zero_init_steps =
+-        std::max<int64_t>(1, static_cast<int64_t>(t_span.size() * 0.04));
+-    for (int64_t step = 1; step < static_cast<int64_t>(t_span.size()); ++step) {
++    // The diffusion step schedule (t/dt values and their sinusoidal
++    // embeddings) depends only on `timesteps` — compute it once per request
++    // batch instead of per patch, and upload the loop-invariant conditioning
++    // (mu, cond) once per patch instead of per step.
++    const auto &sched = step_schedule(timesteps);
++    estimator_.set_conditioning(mu_in, cond_in);
++    for (int64_t step = 1; step <= timesteps; ++step) {
+       std::vector<float> dphi(static_cast<size_t>(patch_elems), 0.0F);
+-      if (step > zero_init_steps) {
++      if (step > sched.zero_init_steps) {
+         std::copy(x.begin(), x.end(), x_in.begin());
+         std::copy(x.begin(), x.end(),
+                   x_in.begin() + static_cast<std::ptrdiff_t>(patch_elems));
+-        const auto time_one =
+-            sinusoidal_time_embedding(t, config.dit.hidden_dim);
+-        const float dt_value = config.dit.mean_mode ? dt : 0.0F;
+-        const auto dt_one =
+-            sinusoidal_time_embedding(dt_value, config.dit.hidden_dim);
+-        std::vector<float> time_embedding(
+-            static_cast<size_t>(2 * config.dit.hidden_dim), 0.0F);
+-        std::vector<float> delta_embedding(
+-            static_cast<size_t>(2 * config.dit.hidden_dim), 0.0F);
+-        std::copy(time_one.begin(), time_one.end(), time_embedding.begin());
+-        std::copy(time_one.begin(), time_one.end(),
+-                  time_embedding.begin() +
+-                      static_cast<std::ptrdiff_t>(config.dit.hidden_dim));
+-        std::copy(dt_one.begin(), dt_one.end(), delta_embedding.begin());
+-        std::copy(dt_one.begin(), dt_one.end(),
+-                  delta_embedding.begin() +
+-                      static_cast<std::ptrdiff_t>(config.dit.hidden_dim));
+-
+-        const auto estimator = estimator_.run(x_in, mu_in, cond_in,
+-                                              time_embedding, delta_embedding);
++        const auto estimator = estimator_.run_step(
++            x_in, sched.time_emb[static_cast<size_t>(step)],
++            sched.delta_emb[static_cast<size_t>(step)]);
+         const float scale = optimized_cfg_scale(estimator, patch_elems);
+         for (int64_t i = 0; i < patch_elems; ++i) {
+           const size_t index = static_cast<size_t>(i);
+@@ -1121,18 +1257,84 @@
+               negative * scale + cfg_value * (positive - negative * scale);
+         }
+       }
++      const float dt = sched.step_dt[static_cast<size_t>(step)];
+       for (int64_t i = 0; i < patch_elems; ++i) {
+         x[static_cast<size_t>(i)] -= dt * dphi[static_cast<size_t>(i)];
+       }
++    }
++    return channel_major_to_patch_major(x);
++  }
++
++private:
++  // Full per-step diffusion schedule for a given timestep count: t/dt values
++  // and the (request-invariant) sinusoidal time/delta-time embeddings.
++  struct CfmStepSchedule {
++    int64_t timesteps = 0;
++    bool mean_mode = false;
++    int64_t zero_init_steps = 1;
++    std::vector<float> step_t;                    // 1-based, [timesteps]
++    std::vector<float> step_dt;                   // 1-based, [timesteps]
++    std::vector<std::vector<float>> time_emb;     // 1-based, [timesteps]
++    std::vector<std::vector<float>> delta_emb;    // 1-based, [timesteps]
++  };
++
++  const CfmStepSchedule &step_schedule(int64_t timesteps) {
++    const auto &config = weights_->assets().config;
++    const bool mean_mode = config.dit.mean_mode;
++    if (schedule_.timesteps == timesteps && schedule_.mean_mode == mean_mode) {
++      return schedule_;
++    }
++    CfmStepSchedule sched;
++    sched.timesteps = timesteps;
++    sched.mean_mode = mean_mode;
++    std::vector<float> t_span(static_cast<size_t>(timesteps + 1), 0.0F);
++    constexpr double kHalfPi = 1.57079632679489661923;
++    for (int64_t i = 0; i <= timesteps; ++i) {
++      const double base =
++          1.0 - static_cast<double>(i) / static_cast<double>(timesteps);
++      t_span[static_cast<size_t>(i)] =
++          static_cast<float>(base + (std::cos(kHalfPi * base) - 1.0 + base));
++    }
++    sched.zero_init_steps =
++        std::max<int64_t>(1, static_cast<int64_t>(t_span.size() * 0.04));
++    const size_t slots = static_cast<size_t>(timesteps + 1);
++    sched.step_t.assign(slots, 0.0F);
++    sched.step_dt.assign(slots, 0.0F);
++    sched.time_emb.assign(slots, {});
++    sched.delta_emb.assign(slots, {});
++    float t = t_span[0];
++    float dt = t_span[0] - t_span[1];
++    for (int64_t step = 1; step <= timesteps; ++step) {
++      sched.step_t[static_cast<size_t>(step)] = t;
++      sched.step_dt[static_cast<size_t>(step)] = dt;
++      const auto time_one =
++          sinusoidal_time_embedding(t, config.dit.hidden_dim);
++      const float dt_value = mean_mode ? dt : 0.0F;
++      const auto dt_one =
++          sinusoidal_time_embedding(dt_value, config.dit.hidden_dim);
++      std::vector<float> time_embedding(
++          static_cast<size_t>(2 * config.dit.hidden_dim), 0.0F);
++      std::vector<float> delta_embedding(
++          static_cast<size_t>(2 * config.dit.hidden_dim), 0.0F);
++      std::copy(time_one.begin(), time_one.end(), time_embedding.begin());
++      std::copy(time_one.begin(), time_one.end(),
++                time_embedding.begin() +
++                    static_cast<std::ptrdiff_t>(config.dit.hidden_dim));
++      std::copy(dt_one.begin(), dt_one.end(), delta_embedding.begin());
++      std::copy(dt_one.begin(), dt_one.end(),
++                delta_embedding.begin() +
++                    static_cast<std::ptrdiff_t>(config.dit.hidden_dim));
++      sched.time_emb[static_cast<size_t>(step)] = std::move(time_embedding);
++      sched.delta_emb[static_cast<size_t>(step)] = std::move(delta_embedding);
+       t -= dt;
+-      if (step < static_cast<int64_t>(t_span.size()) - 1) {
++      if (step < timesteps) {
+         dt = t - t_span[static_cast<size_t>(step + 1)];
+       }
+     }
+-    return channel_major_to_patch_major(x);
++    schedule_ = std::move(sched);
++    return schedule_;
+   }
+ 
+-private:
+   std::vector<float>
+   patch_major_to_channel_major(const std::vector<float> &patch) const {
+     const auto &config = weights_->assets().config;
+@@ -1174,6 +1376,7 @@
+ 
+   std::shared_ptr<const VoxCPM2WeightsRuntime> weights_;
+   VoxCPM2DiTEstimatorRuntime estimator_;
++  CfmStepSchedule schedule_;
+   std::string noise_file_;
+   std::vector<float> noise_values_;
+ };
+@@ -1507,8 +1710,18 @@
+           + std::to_string(max_tokens) + " requested tokens, limit "
+           + std::to_string(config.max_length) + "); shorten the input text");
+     }
++    // Size the KV step caches to this request's real need instead of the
++    // model-wide max_length: per-token attention cost is linear in cache
++    // length, and small requests no longer allocate or attend over 8192-row
++    // caches.
++    const int64_t step_need =
++        static_cast<int64_t>(prefill.rows.size()) + max_tokens;
++    base_lm_.ensure_capacity(step_need);
++    residual_lm_.ensure_capacity(step_need);
+     base_lm_.reset();
+     residual_lm_.reset();
++    debug::trace_log_scalar("voxcpm2.lm_step_cache_capacity",
++                            base_lm_.cache_capacity());
+ 
+     std::vector<float> zero_hidden(static_cast<size_t>(hidden_size), 0.0F);
+     std::vector<float> zero_patch(static_cast<size_t>(patch_elems), 0.0F);
+@@ -1521,14 +1734,29 @@
+     prefill_input.text_mask.reserve(static_cast<size_t>(prefill_input.steps));
+     prefill_input.audio_mask.reserve(static_cast<size_t>(prefill_input.steps));
+     std::vector<float> prefix_cond = zero_patch;
++    // One batched embedding lookup for all text tokens (a single ggml compute
++    // + download) instead of a synced single-token graph per prompt token.
++    std::vector<int32_t> text_token_ids;
++    text_token_ids.reserve(prefill.rows.size());
+     for (const auto &row : prefill.rows) {
+       if (row.text_mask == row.audio_mask) {
+         throw std::runtime_error("VoxCPM2 prefill row mask is invalid");
+       }
++      if (row.text_mask) {
++        text_token_ids.push_back(row.token);
++      }
++    }
++    const std::vector<float> text_embeddings =
++        text_embedding_.embed_tokens(text_token_ids);
++    size_t text_embedding_row = 0;
++    for (const auto &row : prefill.rows) {
+       std::vector<float> input_embedding;
+       std::vector<float> current_embed = zero_hidden;
+       if (row.text_mask) {
+-        input_embedding = text_embedding_.embed_token(row.token);
++        const auto begin = text_embeddings.begin() +
++            static_cast<std::ptrdiff_t>(text_embedding_row * hidden_size);
++        input_embedding.assign(begin, begin + static_cast<std::ptrdiff_t>(hidden_size));
++        ++text_embedding_row;
+       } else {
+         current_embed = row.embedding;
+         if (static_cast<int64_t>(current_embed.size()) != hidden_size) {
+@@ -1582,10 +1810,9 @@
+         streaming_chunks != nullptr || static_cast<bool>(streaming_chunk_callback);
+     const int64_t left_ctx = std::max<int64_t>(0, options.stream_left_context);
+     for (int64_t index = 0; index < max_tokens; ++index) {
+-      const auto projected =
+-          projection_.run(lm_hidden, residual_hidden, zero_hidden);
+-      const auto mu = concat_dit_mu(projected.current_lm_dit_hidden,
+-                                    projected.residual_dit_hidden);
++      const auto emitted = projection_.run_emit(lm_hidden, residual_hidden);
++      const auto mu = concat_dit_mu(emitted.current_lm_dit_hidden,
++                                    emitted.residual_dit_hidden);
+       const auto patch = cfm_.generate_patch(
+           mu, prefix_cond, options.num_inference_steps, options.guidance_scale,
+           options.seed, patch_noise_start, options.cfm_noise_file);
+@@ -1616,17 +1843,16 @@
+       prefix_cond = patch;
+ 
+       if (index > options.min_tokens &&
+-          stop_class(projected.current_stop_logits) == 1) {
++          stop_class(emitted.current_stop_logits) == 1) {
+         break;
+       }
+ 
+       const auto curr_embed = local_encoder_.encode_patch(patch);
+       const auto next_lm = base_lm_.run_step(curr_embed).hidden;
+-      const auto next_projected =
+-          projection_.run(next_lm, residual_hidden, curr_embed);
+-      lm_hidden = next_projected.fsq_hidden;
++      const auto next_advance = projection_.run_advance(next_lm, curr_embed);
++      lm_hidden = next_advance.fsq_hidden;
+       residual_hidden =
+-          residual_lm_.run_step(next_projected.residual_input).hidden;
++          residual_lm_.run_step(next_advance.residual_input).hidden;
+     }
+     return result;
+   }
+--- a/src/models/voxcpm2/audiovae.cpp
++++ b/src/models/voxcpm2/audiovae.cpp
+@@ -425,9 +425,8 @@
+   const auto input_f32 = core::ensure_backend_addressable_layout(ctx, input);
+   auto alpha = core::reshape_tensor(
+       ctx, weights.alpha, core::TensorShape::from_dims({1, channels, 1}));
+-  alpha =
+-      core::wrap_tensor(ggml_repeat(ctx.ggml, alpha.tensor, input_f32.tensor),
+-                        input.shape, GGML_TYPE_F32);
++  // Broadcast the per-channel alpha against {1, C, T} instead of
++  // materializing a full-size ggml_repeat copy per snake activation.
+   auto ax =
+       core::wrap_tensor(ggml_mul(ctx.ggml, input_f32.tensor, alpha.tensor),
+                         input.shape, GGML_TYPE_F32);
+@@ -437,7 +436,7 @@
+                               input.shape, GGML_TYPE_F32);
+   auto denom =
+       core::wrap_tensor(ggml_scale_bias(ctx.ggml, alpha.tensor, 1.0F, 1.0e-9F),
+-                        input.shape, GGML_TYPE_F32);
++                        alpha.shape, GGML_TYPE_F32);
+   auto frac = core::wrap_tensor(ggml_div(ctx.ggml, s2.tensor, denom.tensor),
+                                 input.shape, GGML_TYPE_F32);
+   return core::wrap_tensor(ggml_add(ctx.ggml, input_f32.tensor, frac.tensor),
+@@ -450,13 +449,9 @@
+   const auto input_f32 = core::ensure_backend_addressable_layout(ctx, input);
+   auto scale = core::reshape_tensor(
+       ctx, weights.scale, core::TensorShape::from_dims({1, channels, 1}));
+-  scale =
+-      core::wrap_tensor(ggml_repeat(ctx.ggml, scale.tensor, input_f32.tensor),
+-                        input.shape, GGML_TYPE_F32);
+   auto bias = core::reshape_tensor(
+       ctx, weights.bias, core::TensorShape::from_dims({1, channels, 1}));
+-  bias = core::wrap_tensor(ggml_repeat(ctx.ggml, bias.tensor, input_f32.tensor),
+-                           input.shape, GGML_TYPE_F32);
++  // Broadcast {1, C, 1} scale/bias against {1, C, T} (no ggml_repeat copies).
+   auto scaled =
+       core::wrap_tensor(ggml_mul(ctx.ggml, input_f32.tensor, scale.tensor),
+                         input.shape, GGML_TYPE_F32);

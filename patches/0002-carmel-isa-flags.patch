@@ -1,0 +1,13 @@
+--- a/external/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/external/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -147,6 +147,11 @@
+                     endif()
+                 endif()
+ 
++                # Xavier NX (Carmel): gcc-13 dropped -mcpu=carmel, native probe
++                # resolves to a broken armv8-a baseline. Hardcode the real ISA.
++                set(ARM_NATIVE_FLAG "-march=armv8.2-a+fp16+dotprod")
++
+                 include(CheckCXXSourceRuns)
+ 
+                 macro(check_arm_feature tag feature code)

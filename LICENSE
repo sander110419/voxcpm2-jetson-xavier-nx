@@ -1,0 +1,13 @@
+Apache License 2.0
+
+The patches, scripts, configuration templates and documentation in this
+repository are licensed under the Apache License, Version 2.0 — the same
+license as the upstream projects they build on:
+
+- audio.cpp (https://github.com/0xShug0/audio.cpp), Copyright 2026 ShugoAI LLC,
+  Apache License 2.0. The files under patches/ are modifications to that
+  codebase and carry the same license.
+- VoxCPM2 (https://github.com/OpenBMB/VoxCPM2), OpenBMB, Apache License 2.0.
+
+A copy of the Apache License 2.0 is available at
+https://www.apache.org/licenses/LICENSE-2.0

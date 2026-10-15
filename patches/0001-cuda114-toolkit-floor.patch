@@ -1,0 +1,11 @@
+--- CMakeLists.txt	2026-10-14 17:28:00.000000000 +0200
++++ /tmp/patched_jetson/root-CMakeLists.txt	2026-10-15 00:31:58.353637532 +0200
+@@ -215,7 +215,7 @@
+     # Require at least CUDA 12.0. Older toolkits configure fine but die at the
+     # first .cu file. Run this before enable_language(CUDA) because the version
+     # is needed for the default arch list below.
+-    find_package(CUDAToolkit 12.0 REQUIRED)
++    find_package(CUDAToolkit 11.4 REQUIRED)  # Xavier JP5: 11.4 is the ceiling, try our luck
+ 
+     # Define default CUDA architectures for every build path.
+     # We stay close to llama.cpp/ggml-cuda here, unless there is a reason
