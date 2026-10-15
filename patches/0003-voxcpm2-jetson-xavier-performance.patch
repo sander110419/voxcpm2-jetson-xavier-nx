@@ -1128,7 +1128,7 @@
  
  std::vector<float> sinusoidal_time_embedding(float timestep,
                                               int64_t hidden_size) {
-@@ -1072,45 +1232,21 @@
+@@ -1072,45 +1232,23 @@
      std::copy(cond.begin(), cond.end(),
                cond_in.begin() + static_cast<std::ptrdiff_t>(patch_elems));
  
@@ -1148,10 +1148,12 @@
 -    for (int64_t step = 1; step < static_cast<int64_t>(t_span.size()); ++step) {
 +    // The diffusion step schedule (t/dt values and their sinusoidal
 +    // embeddings) depends only on `timesteps` — compute it once per request
-+    // batch instead of per patch, and upload the loop-invariant conditioning
-+    // (mu, cond) once per patch instead of per step.
++    // batch instead of per patch.
++    // NOTE: conditioning (mu/cond) is deliberately re-uploaded on every
++    // estimator call. Hoisting it to once per patch was measured to corrupt
++    // output on the default (mem_saver) path (PR #921 review evidence), so
++    // the estimator's run() keeps its original per-call upload semantics.
 +    const auto &sched = step_schedule(timesteps);
-+    estimator_.set_conditioning(mu_in, cond_in);
 +    for (int64_t step = 1; step <= timesteps; ++step) {
        std::vector<float> dphi(static_cast<size_t>(patch_elems), 0.0F);
 -      if (step > zero_init_steps) {
@@ -1179,13 +1181,13 @@
 -
 -        const auto estimator = estimator_.run(x_in, mu_in, cond_in,
 -                                              time_embedding, delta_embedding);
-+        const auto estimator = estimator_.run_step(
-+            x_in, sched.time_emb[static_cast<size_t>(step)],
++        const auto estimator = estimator_.run(
++            x_in, mu_in, cond_in, sched.time_emb[static_cast<size_t>(step)],
 +            sched.delta_emb[static_cast<size_t>(step)]);
          const float scale = optimized_cfg_scale(estimator, patch_elems);
          for (int64_t i = 0; i < patch_elems; ++i) {
            const size_t index = static_cast<size_t>(i);
-@@ -1121,18 +1257,84 @@
+@@ -1121,18 +1259,84 @@
                negative * scale + cfg_value * (positive - negative * scale);
          }
        }
@@ -1273,7 +1275,7 @@
    std::vector<float>
    patch_major_to_channel_major(const std::vector<float> &patch) const {
      const auto &config = weights_->assets().config;
-@@ -1174,6 +1376,7 @@
+@@ -1174,6 +1378,7 @@
  
    std::shared_ptr<const VoxCPM2WeightsRuntime> weights_;
    VoxCPM2DiTEstimatorRuntime estimator_;
@@ -1281,7 +1283,7 @@
    std::string noise_file_;
    std::vector<float> noise_values_;
  };
-@@ -1507,8 +1710,18 @@
+@@ -1507,8 +1712,18 @@
            + std::to_string(max_tokens) + " requested tokens, limit "
            + std::to_string(config.max_length) + "); shorten the input text");
      }
@@ -1300,7 +1302,7 @@
  
      std::vector<float> zero_hidden(static_cast<size_t>(hidden_size), 0.0F);
      std::vector<float> zero_patch(static_cast<size_t>(patch_elems), 0.0F);
-@@ -1521,14 +1734,29 @@
+@@ -1521,14 +1736,29 @@
      prefill_input.text_mask.reserve(static_cast<size_t>(prefill_input.steps));
      prefill_input.audio_mask.reserve(static_cast<size_t>(prefill_input.steps));
      std::vector<float> prefix_cond = zero_patch;
@@ -1331,7 +1333,7 @@
        } else {
          current_embed = row.embedding;
          if (static_cast<int64_t>(current_embed.size()) != hidden_size) {
-@@ -1582,10 +1810,9 @@
+@@ -1582,10 +1812,9 @@
          streaming_chunks != nullptr || static_cast<bool>(streaming_chunk_callback);
      const int64_t left_ctx = std::max<int64_t>(0, options.stream_left_context);
      for (int64_t index = 0; index < max_tokens; ++index) {
@@ -1345,7 +1347,7 @@
        const auto patch = cfm_.generate_patch(
            mu, prefix_cond, options.num_inference_steps, options.guidance_scale,
            options.seed, patch_noise_start, options.cfm_noise_file);
-@@ -1616,17 +1843,16 @@
+@@ -1616,17 +1845,16 @@
        prefix_cond = patch;
  
        if (index > options.min_tokens &&
