@@ -33,10 +33,51 @@ audio in ~0.6 s.
 - `config/voxcpm2_server.json` — production server config (streaming, Q4_K GGUF).
 - `scripts/tts_adapter.py` — stdlib-only streaming HTTP adapter:
   `GET /v1/audio/stream?input=...` → 24 kHz WAV stream, ready to front a voice agent.
+- `scripts/llm_bridge.py` — the assistant brain: `POST /ask {"text": ...}` →
+  `{"reply": ...}` against **your** LLM provider (OpenAI, Anthropic, Moonshot,
+  Mistral, LM Studio, or any OpenAI-compatible endpoint), configured entirely by
+  environment variables — no API key ever lives in code (see below).
 - `scripts/cuda_compact_shim.c` — `LD_PRELOAD` interposer that retries failed
   `cudaMalloc` after cache-drop + memory compaction (Tegra NvMap contiguity fix).
 - `bench/bench_vx.py` — the benchmark harness used for the numbers above.
+- `bench/test_llm_bridge.py` — provider-shape tests for the LLM bridge (runs against
+  a local mock, no real keys needed).
+- `docker-compose.example.yml` + `.env.example` — three-service pipeline (TTS engine,
+  adapter, LLM bridge) with all secrets injected from `.env`.
 - `docs/GUIDE.md` — full build/convert/run/verify guide with every pitfall included.
+
+## Plug in your own LLM (OpenAI / Anthropic / Moonshot / Mistral / LM Studio)
+
+`scripts/llm_bridge.py` is a stdlib-only service that maps the voice pipeline's
+`POST /ask {"text": "..."}` onto your provider of choice:
+
+```bash
+# pick one provider and export its key — NEVER put the key in code or git:
+export LLM_PROVIDER=openai            # openai | anthropic | moonshot | mistral | lmstudio | openai_compatible
+export LLM_API_KEY=sk-...             # not needed for lmstudio / local endpoints
+# optional: export LLM_MODEL=..., LLM_BASE_URL=..., LLM_SYSTEM_PROMPT=...
+python3 scripts/llm_bridge.py         # serves :8401  (POST /ask, GET /health)
+```
+
+Provider defaults (override with `LLM_BASE_URL` / `LLM_MODEL`):
+
+| provider | default endpoint | default model | key needed |
+|---|---|---|---|
+| `openai` | `https://api.openai.com/v1` | `gpt-4o-mini` | yes |
+| `anthropic` | `https://api.anthropic.com/v1` | `claude-3-5-haiku-latest` | yes |
+| `moonshot` | `https://api.moonshot.ai/v1` | `moonshot-v1-8k` | yes |
+| `mistral` | `https://api.mistral.ai/v1` | `mistral-small-latest` | yes |
+| `lmstudio` | `http://localhost:1234/v1` | loaded model | no |
+| `openai_compatible` | `http://localhost:1234/v1` | `local-model` | no |
+
+With Docker, put the key in an untracked `.env` (see `.env.example`) and use
+`docker-compose.example.yml` — the compose file injects `LLM_API_KEY` as a container
+environment variable only. The bridge refuses to start for cloud providers when the
+key is missing, and the request shapes for every provider are covered by
+`bench/test_llm_bridge.py` (mock-tested; no real credentials required).
+
+The bridge keeps a short per-session history (`LLM_HISTORY`, default 10 turns) and
+defaults to a speakable-answers system prompt — tune with `LLM_SYSTEM_PROMPT`.
 
 ## The performance patch, in order of impact
 
@@ -89,6 +130,11 @@ ninja -C build audiocpp_cli audiocpp_server audiocpp_gguf
 # 3. Run (config in config/): engine on :8402, adapter on :8399
 audiocpp_server --config voxcpm2_server.json --no-ui
 python3 scripts/tts_adapter.py
+
+# 4. Optional — the assistant brain, with YOUR provider (keys via env only):
+export LLM_PROVIDER=openai   # anthropic / moonshot / mistral / lmstudio / ...
+export LLM_API_KEY=sk-...    # never in code or git
+python3 scripts/llm_bridge.py   # POST :8401/ask
 ```
 
 Full instructions, the reference-voice recipe, the streaming API contract, and the

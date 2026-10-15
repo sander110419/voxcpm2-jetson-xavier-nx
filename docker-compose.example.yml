@@ -1,0 +1,55 @@
+# docker-compose.example.yml — full on-device assistant pipeline on the Jetson.
+# Copy to docker-compose.yml, fill in .env (see .env.example), `docker compose up -d`.
+#
+# Three services:
+#   tts-engine   audio.cpp server with the VoxCPM2 Q4_K GGUF (:8402)
+#   tts-adapter  voice-agent contract shim, 48k->24k WAV stream (:8399)
+#   llm-bridge   provider-agnostic LLM endpoint (:8401)  <-- configure YOUR provider here
+#
+# Your wake-word/STT agent then just needs three URLs:
+#   WHISPER_URL = http://<jetson>:8080/inference     (your whisper.cpp server)
+#   BRIDGE_URL  = http://<jetson>:8401/ask           (this repo's llm_bridge)
+#   TTS_URL     = http://<jetson>:8399/v1/audio/stream
+
+services:
+  tts-engine:
+    image: audiocpp-build            # see docs/GUIDE.md §2 for the builder image
+    container_name: tts-voxcpm
+    runtime: nvidia
+    network_mode: host
+    privileged: true                 # the compaction shim writes /proc/sys/vm
+    restart: unless-stopped
+    environment:
+      LD_PRELOAD: /bench/cuda_compact_shim.so
+    volumes:
+      - ./data:/bench                # voxcpm2-q4_k.gguf, voxcpm2_server.json, ref_voice.wav, cuda_compact_shim.so
+      - ./build114:/build            # the build tree from docs/GUIDE.md §4
+    command: ["/build/bin/audiocpp_server", "--config", "/bench/voxcpm2_server.json", "--no-ui"]
+
+  tts-adapter:
+    image: python:3.12-slim
+    container_name: tts-adapter
+    network_mode: host
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ../scripts:/app:ro
+    command: ["python", "/app/tts_adapter.py"]
+
+  llm-bridge:
+    image: python:3.12-slim
+    container_name: llm-bridge
+    network_mode: host
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ../scripts:/app:ro
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}  # required for cloud providers, empty for lmstudio/local
+      LLM_SYSTEM_PROMPT: ${LLM_SYSTEM_PROMPT:-}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-300}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.7}
+    command: ["python", "/app/llm_bridge.py"]

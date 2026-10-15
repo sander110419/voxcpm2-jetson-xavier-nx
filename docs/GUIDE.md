@@ -170,6 +170,30 @@ fly with *stateful* `audioop.ratecv`. Non-obvious details it handles: fake max-s
 WAV header for unknown length, odd-byte guard so a network chunk never splits a
 16-bit sample, `Connection: close` as body terminator, 600 s timeout.
 
+## 8a. The assistant brain (LLM bridge) — bring your own provider
+
+For a full voice-assistant pipeline you need an LLM behind the agent.
+`scripts/llm_bridge.py` provides `POST /ask {"text": ...}` → `{"reply": ...}` against
+OpenAI, Anthropic, Moonshot, Mistral, LM Studio, or any OpenAI-compatible endpoint,
+configured ONLY via environment / Docker variables:
+
+```bash
+export LLM_PROVIDER=anthropic            # or openai / moonshot / mistral / lmstudio / openai_compatible
+export LLM_API_KEY=...                   # set in the environment or .env — never in code or git
+python3 scripts/llm_bridge.py            # :8401 — POST /ask, GET /health
+```
+
+Per-provider default endpoints and models are built in (see the README table);
+override with `LLM_BASE_URL` / `LLM_MODEL`. LM Studio and other local endpoints need
+no key. Tunables: `LLM_SYSTEM_PROMPT` (defaults to short speakable answers),
+`LLM_MAX_TOKENS`, `LLM_TEMPERATURE`, `LLM_HISTORY` (in-memory turn count),
+`LISTEN_PORT`. The bridge exits with a clear error if a cloud provider is selected
+without `LLM_API_KEY`. `bench/test_llm_bridge.py` verifies every provider's request
+shape against a local mock — run it after any change: `python3 bench/test_llm_bridge.py`.
+
+`docker-compose.example.yml` wires the whole on-device stack (TTS engine + adapter +
+LLM bridge) and injects secrets from an untracked `.env` (template: `.env.example`).
+
 ## 9. The Tegra memory shim (you will need it on a lived-in box)
 
 Tegra's NvMap fails large `cudaMalloc`s on *contiguity*, not total memory — a
