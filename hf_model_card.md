@@ -69,6 +69,10 @@ streaming), `num_inference_steps=4`, `guidance_scale=2.0` (do not lower — brea
 
 Full build/convert/run guide with all Jetson pitfalls:
 [docs/GUIDE.md](https://github.com/sander110419/voxcpm2-jetson-xavier-nx/blob/master/docs/GUIDE.md).
+The same repo also carries a small stdlib-only LLM bridge (`scripts/llm_bridge.py`)
+that turns the TTS into a full assistant pipeline with your own provider —
+OpenAI, Anthropic, Moonshot, Mistral, LM Studio or any OpenAI-compatible endpoint —
+configured purely through environment/Docker variables (no keys in code).
 
 ## License & attribution
 
