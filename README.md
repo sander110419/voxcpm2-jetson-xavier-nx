@@ -37,6 +37,11 @@ audio in ~0.6 s.
   `{"reply": ...}` against **your** LLM provider (OpenAI, Anthropic, Moonshot,
   Mistral, LM Studio, or any OpenAI-compatible endpoint), configured entirely by
   environment variables — no API key ever lives in code (see below).
+- `scripts/voice_watchdog.py` — tiny container watchdog for the on-device stack:
+  restarts a wedged voice agent (sustained CPU pin + silent logs — the state
+  Docker's restart policy can't see) and any service whose health endpoint dies
+  while its container stays "Up". Runs in a container with the docker socket
+  mounted; thresholds via `WATCHDOG_*` env vars.
 - `scripts/cuda_compact_shim.c` — `LD_PRELOAD` interposer that retries failed
   `cudaMalloc` after cache-drop + memory compaction (Tegra NvMap contiguity fix).
 - `bench/bench_vx.py` — the benchmark harness used for the numbers above.

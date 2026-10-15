@@ -194,6 +194,31 @@ shape against a local mock — run it after any change: `python3 bench/test_llm_
 `docker-compose.example.yml` wires the whole on-device stack (TTS engine + adapter +
 LLM bridge) and injects secrets from an untracked `.env` (template: `.env.example`).
 
+## 8b. Watchdog (optional but recommended on-device)
+
+Docker's `--restart unless-stopped` only covers crashes. Two real failure modes slip
+through: the voice agent wedging while alive (process pinned at high CPU, log silent —
+the wake word stops answering), and a service container showing "Up" while its HTTP
+endpoint is dead. `scripts/voice_watchdog.py` covers both. It runs in a small
+container with the docker socket mounted, checks every minute, and restarts the
+offender — rate-limited to one restart per service per 10 minutes.
+
+```bash
+docker run -d --name voice-watchdog --network host --restart unless-stopped \
+  --entrypoint python3 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /opt/voxcpm2/scripts:/voice:ro \
+  python:3.12-slim /voice/voice_watchdog.py
+```
+
+Defaults calibrated on the Xavier: wedge = >22% sustained container CPU plus zero log
+output for 10 minutes, twice in a row (healthy wake-word listening sits at ~14-15%);
+health checks restart after 3 consecutive dead minutes. Override with
+`WATCHDOG_WEDGE_CPU_PCT`, `WATCHDOG_LOG_SILENCE_MIN`, `WATCHDOG_WEDGE_CHECKS`,
+`WATCHDOG_HEALTH_FAILS`, `WATCHDOG_RESTART_COOLDOWN_S`. Edit the HEALTH map at the top
+of the script to match your service names and ports. Follow its decisions with
+`docker logs voice-watchdog`.
+
 ## 9. The Tegra memory shim (you will need it on a lived-in box)
 
 Tegra's NvMap fails large `cudaMalloc`s on *contiguity*, not total memory — a
