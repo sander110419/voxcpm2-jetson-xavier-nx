@@ -45,7 +45,7 @@
      for (size_t layer = 0; layer < layers_.size(); ++layer) {
          auto & cache = layers_[layer];
          const auto & source = state.layers[layer];
-@@ -159,30 +165,48 @@
+@@ -159,30 +165,61 @@
          if (source.key.size() != keep_elems) {
              throw std::runtime_error("TransformerKVCache source tensors do not match valid_steps * step_elems");
          }
@@ -55,7 +55,23 @@
 -            cache.import_value_scratch.resize(cache_elems);
 -            std::fill(cache.import_key_scratch.begin(), cache.import_key_scratch.end(), 0.0F);
 -            std::fill(cache.import_value_scratch.begin(), cache.import_value_scratch.end(), 0.0F);
--            if (keep_elems > 0) {
++        if (cache_steps_ <= 0) {
++            continue;
++        }
++        if (prefix_only) {
++            // Prefix rows are contiguous floats at offset 0 in the cache
++            // tensors ({1, cache_steps, heads, dim} dense layout). The tail
++            // beyond the valid prefix is zeroed as well: stale finite values
++            // left by a previous request are masked from the attention result,
++            // but zeroing keeps every byte of the cache identical between
++            // identical requests, which measurably stabilizes the draw
++            // (first-use vs repeat outputs otherwise differ).
++            if (cache.key_tensor.type != GGML_TYPE_F32 ||
++                cache.value_tensor.type != GGML_TYPE_F32) {
++                throw std::runtime_error(
++                    "TransformerKVCache import_prefix_only requires f32 cache tensors");
++            }
+             if (keep_elems > 0) {
 -                if (!options_.ring_mode) {
 -                    std::copy(source.key.begin(), source.key.end(), cache.import_key_scratch.begin());
 -                    std::copy(source.value.begin(), source.value.end(), cache.import_value_scratch.begin());
@@ -68,24 +84,20 @@
 -                        copy_cache_row(
 -                            source.value, row, cache.import_value_scratch, slot_for_position(position), step_elems_);
 -                    }
-+        if (cache_steps_ <= 0) {
-+            continue;
-+        }
-+        if (prefix_only) {
-+            // Prefix rows are contiguous floats at offset 0 in the cache
-+            // tensors ({1, cache_steps, heads, dim} dense layout).
-+            if (keep_elems == 0) {
-+                continue;
++                ggml_backend_tensor_set(cache.key_tensor.tensor, source.key.data(), 0,
++                                        keep_elems * sizeof(float));
++                ggml_backend_tensor_set(cache.value_tensor.tensor, source.value.data(), 0,
++                                        keep_elems * sizeof(float));
 +            }
-+            if (cache.key_tensor.type != GGML_TYPE_F32 ||
-+                cache.value_tensor.type != GGML_TYPE_F32) {
-+                throw std::runtime_error(
-+                    "TransformerKVCache import_prefix_only requires f32 cache tensors");
++            const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
++            if (keep_elems < cache_elems) {
++                ggml_backend_tensor_memset(cache.key_tensor.tensor, 0,
++                                           keep_elems * sizeof(float),
++                                           (cache_elems - keep_elems) * sizeof(float));
++                ggml_backend_tensor_memset(cache.value_tensor.tensor, 0,
++                                           keep_elems * sizeof(float),
++                                           (cache_elems - keep_elems) * sizeof(float));
 +            }
-+            ggml_backend_tensor_set(cache.key_tensor.tensor, source.key.data(), 0,
-+                                    keep_elems * sizeof(float));
-+            ggml_backend_tensor_set(cache.value_tensor.tensor, source.value.data(), 0,
-+                                    keep_elems * sizeof(float));
 +            continue;
 +        }
 +        const size_t cache_elems = static_cast<size_t>(cache_steps_ * step_elems_);
@@ -333,6 +345,19 @@
  struct MiniCPMLayerWithCacheOutput {
    engine::core::TensorValue output;
    engine::core::TensorValue key;
+@@ -547,9 +686,9 @@
+                 .build(ctx, hidden, layer.up_proj);
+   auto gated = engine::modules::MulModule{}.build(ctx, gate, up);
+   auto ff = engine::modules::LinearModule(
+-                binding::linear_config(config.intermediate_size,
+-                                       config.hidden_size, false))
+-                .build(ctx, gated, layer.down_proj);
++                  binding::linear_config(config.intermediate_size,
++                                         config.hidden_size, false))
++                  .build(ctx, gated, layer.down_proj);
+   auto output = add.build(
+       ctx, x,
+       scale_tensor(ctx, ff,
 @@ -575,7 +714,7 @@
      }
    }
@@ -342,32 +367,68 @@
  
    VoxCPM2PromptPrefillOutput run(const VoxCPM2PromptPrefillInput &input) {
      const auto &config = weights_->assets().config;
-@@ -597,21 +736,24 @@
+@@ -597,21 +736,56 @@
          static_cast<int64_t>(input.audio_mask.size()) != input.steps) {
        throw std::runtime_error("VoxCPM2 prompt prefill mask size mismatch");
      }
 -    if (sequence_steps_ != input.steps) {
 -      build(input.steps);
--    }
++    // Pick the smallest fixed bucket that fits; one graph per bucket per
++    // server lifetime (escape hatch: exact-size graph beyond the ladder).
++    // Padded prefill keeps every request on a warm, already-seen layout —
++    // per-length graph rebuilds measurably re-rolled the autoregressive draw.
++    PrefillGraph &g = graph_for(bucket_for(input.steps));
++    const int64_t cap = g.steps;
++    const int64_t real = input.steps;
++    // Zero the compute arena before uploading: any leftover-sensitive read
++    // inside the graph then sees a constant zero baseline instead of the
++    // previous compute's intermediates, so identical inputs give identical
++    // outputs regardless of request history.
++    if (g.arena_buffer != nullptr) {
++      ggml_backend_buffer_clear(g.arena_buffer, 0);
++      // positions live in the arena: re-upload after clearing.
++      std::vector<int32_t> position_ids(static_cast<size_t>(cap), 0);
++      for (int64_t i = 0; i < cap; ++i) {
++        position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
++      }
++      ggml_backend_tensor_set(g.positions, position_ids.data(), 0,
++                              position_ids.size() * sizeof(int32_t));
+     }
 -    ggml_backend_tensor_set(input_embeddings_, input.input_embeddings.data(), 0,
-+    // Use a per-length cached graph. Rebuilding a fresh ggml graph for a new
-+    // length changes allocator layout just enough to perturb ulp-level numerics,
-+    // which the autoregressive loop amplifies into a visibly different draw
-+    // (different pacing/stop point). Reusing the warm graph per length keeps
-+    // repeated requests of the same length reproducible.
-+    PrefillGraph &g = graph_for(input.steps);
-+    ggml_backend_tensor_set(g.input_embeddings, input.input_embeddings.data(), 0,
-                             input.input_embeddings.size() * sizeof(float));
+-                            input.input_embeddings.size() * sizeof(float));
 -    ggml_backend_tensor_set(current_embeddings_,
-+    ggml_backend_tensor_set(g.current_embeddings,
-                             input.current_embeddings.data(), 0,
-                             input.current_embeddings.size() * sizeof(float));
+-                            input.current_embeddings.data(), 0,
+-                            input.current_embeddings.size() * sizeof(float));
 -    ggml_backend_tensor_set(text_mask_, input.text_mask.data(), 0,
-+    ggml_backend_tensor_set(g.text_mask, input.text_mask.data(), 0,
-                             input.text_mask.size() * sizeof(float));
+-                            input.text_mask.size() * sizeof(float));
 -    ggml_backend_tensor_set(audio_mask_, input.audio_mask.data(), 0,
-+    ggml_backend_tensor_set(g.audio_mask, input.audio_mask.data(), 0,
-                             input.audio_mask.size() * sizeof(float));
+-                            input.audio_mask.size() * sizeof(float));
++    auto upload_padded = [&](ggml_tensor *t, const std::vector<float> &data) {
++      ggml_backend_tensor_set(t, data.data(), 0,
++                              data.size() * sizeof(float));
++      const size_t tail = (static_cast<size_t>(cap) * hidden_size - data.size()) *
++                          sizeof(float);
++      if (tail > 0) {
++        ggml_backend_tensor_memset(t, 0, data.size() * sizeof(float), tail);
++      }
++    };
++    upload_padded(g.input_embeddings, input.input_embeddings);
++    upload_padded(g.current_embeddings, input.current_embeddings);
++    auto upload_padded_mask = [&](ggml_tensor *t, const std::vector<float> &data) {
++      ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++      const size_t tail =
++          (static_cast<size_t>(cap) - data.size()) * sizeof(float);
++      if (tail > 0) {
++        ggml_backend_tensor_memset(t, 0, data.size() * sizeof(float), tail);
++      }
++    };
++    upload_padded_mask(g.text_mask, input.text_mask);
++    upload_padded_mask(g.audio_mask, input.audio_mask);
++    // One-hot picker for the last REAL row (pad rows sit at the tail and are
++    // causally invisible, but the output row index varies per request).
++    std::vector<float> pick(static_cast<size_t>(cap), 0.0F);
++    pick[static_cast<size_t>(real - 1)] = 1.0F;
++    ggml_backend_tensor_set(g.pick, pick.data(), 0, pick.size() * sizeof(float));
      engine::core::set_backend_threads(weights_->backend(), weights_->threads());
      const ggml_status status =
 -        engine::core::compute_backend_graph(weights_->backend(), graph_);
@@ -375,7 +436,7 @@
      ggml_backend_synchronize(weights_->backend());
      if (status != GGML_STATUS_SUCCESS) {
        throw std::runtime_error("VoxCPM2 prompt prefill graph compute failed");
-@@ -620,39 +762,70 @@
+@@ -620,39 +794,72 @@
      VoxCPM2PromptPrefillOutput output;
      output.lm_hidden.resize(static_cast<size_t>(hidden_size), 0.0F);
      output.residual_hidden.resize(static_cast<size_t>(hidden_size), 0.0F);
@@ -392,14 +453,14 @@
 -                                       head_dim(config.lm));
 -    output.residual_state = read_state(residual_keys_, residual_values_,
 +                                       head_dim(config.lm),
-+                                   g.steps);
++                                   real);
 +    output.residual_state = read_state(g.residual_keys, g.residual_values,
                                         config.residual_lm_num_layers > 0
                                             ? config.lm.num_key_value_heads *
                                                   head_dim(config.lm)
 -                                           : 0);
 +                                           : 0,
-+                                       g.steps);
++                                       real);
      return output;
    }
  
@@ -417,6 +478,7 @@
 +    ggml_tensor *text_mask = nullptr;
 +    ggml_tensor *audio_mask = nullptr;
 +    ggml_tensor *positions = nullptr;
++    ggml_tensor *pick = nullptr;
 +    ggml_tensor *lm_hidden_output = nullptr;
 +    ggml_tensor *residual_hidden_output = nullptr;
 +    std::vector<ggml_tensor *> base_keys;
@@ -425,6 +487,7 @@
 +    std::vector<ggml_tensor *> residual_values;
 +    ggml_cgraph *graph = nullptr;
 +    ggml_gallocr_t gallocr = nullptr;
++    ggml_backend_buffer_t arena_buffer = nullptr;  // cleared before each compute
 +
 +    ~PrefillGraph() {
 +      if (graph != nullptr) {
@@ -458,14 +521,28 @@
        layer_state.key.resize(layer_values);
        layer_state.value.resize(layer_values);
        ggml_backend_tensor_get(keys[layer], layer_state.key.data(), 0,
-@@ -663,77 +836,73 @@
+@@ -663,77 +870,96 @@
      return state;
    }
  
 -  void release_graph() {
 -    if (graph_ != nullptr) {
 -      engine::core::release_backend_graph_resources(weights_->backend(), graph_);
-+  // Front of graphs_ is the active/most-recently-used length.
++  // Front of graphs_ is the active/most-recently-used bucket.
++  static int64_t bucket_for(int64_t steps) {
++    // Few fixed layouts per server lifetime; pad up to the smallest fit.
++    static const int64_t kBuckets[] = {256, 512, 1024};
++    for (const int64_t bucket : kBuckets) {
++      if (steps <= bucket) {
++        return bucket;
++      }
+     }
+-    if (gallocr_ != nullptr) {
+-      ggml_gallocr_free(gallocr_);
+-      gallocr_ = nullptr;
++    return steps;  // escape hatch: exact-size graph beyond the ladder
++  }
++
 +  PrefillGraph &graph_for(int64_t steps) {
 +    for (auto it = graphs_.begin(); it != graphs_.end(); ++it) {
 +      if ((*it)->steps == steps) {
@@ -474,13 +551,6 @@
 +        }
 +        return *graphs_.front();
 +      }
-     }
--    if (gallocr_ != nullptr) {
--      ggml_gallocr_free(gallocr_);
--      gallocr_ = nullptr;
-+    graphs_.push_front(build(steps));
-+    while (graphs_.size() > kMaxPrefillGraphs) {
-+      graphs_.pop_back();
      }
 -    graph_ = nullptr;
 -    input_embeddings_ = nullptr;
@@ -496,6 +566,10 @@
 -    residual_values_.clear();
 -    ctx_.reset();
 -    sequence_steps_ = 0;
++    graphs_.push_front(build(steps));
++    while (graphs_.size() > kMaxPrefillGraphs) {
++      graphs_.pop_back();
++    }
 +    return *graphs_.front();
    }
  
@@ -548,6 +622,18 @@
 -        positions_, engine::core::TensorShape::from_dims({steps}),
 +        g->positions, engine::core::TensorShape::from_dims({steps}),
          GGML_TYPE_I32);
++    // Protect the input tensors from gallocr arena reuse: unmarked leaf
++    // tensors are pool candidates, and an input read late in the graph
++    // (current_embeddings enters the residual concat after all layers) can
++    // otherwise read arena memory an intermediate overwrote mid-compute.
++    ggml_set_input(g->input_embeddings);
++    ggml_set_input(g->current_embeddings);
++    ggml_set_input(g->text_mask);
++    ggml_set_input(g->audio_mask);
++    ggml_set_input(g->positions);
++    // One-hot picker for the (variable) last real row; uploaded per request.
++    g->pick = ggml_new_tensor_1d(raw_ctx, GGML_TYPE_F32, steps);
++    ggml_set_input(g->pick);
      auto base_hidden = input_embeddings;
      for (const auto &layer : model_weights.base_lm.layers) {
        auto layer_out = minicpm_prefill_layer(
@@ -571,7 +657,7 @@
      }
      base_hidden = engine::modules::RMSNormModule(
                        {config.lm.hidden_size, config.lm.rms_norm_eps, true,
-@@ -783,15 +952,15 @@
+@@ -783,15 +1009,15 @@
        auto layer_out = minicpm_prefill_layer(
            ctx, residual_hidden, positions, layer, model_weights.residual_lm);
        residual_hidden = layer_out.output;
@@ -593,17 +679,21 @@
      }
      residual_hidden = engine::modules::RMSNormModule(
                            {config.lm.hidden_size, config.lm.rms_norm_eps, true,
-@@ -804,39 +973,34 @@
-     last_lm = engine::core::reshape_tensor(
-         ctx, ensure_contiguous(ctx, last_lm),
-         engine::core::TensorShape::from_dims({config.lm.hidden_size}));
+@@ -799,73 +1025,108 @@
+                           .build(ctx, residual_hidden,
+                                  model_weights.residual_lm.norm);
+ 
+-    auto last_lm = engine::modules::SliceModule({1, steps - 1, 1})
+-                       .build(ctx, lm_hidden);
+-    last_lm = engine::core::reshape_tensor(
+-        ctx, ensure_contiguous(ctx, last_lm),
+-        engine::core::TensorShape::from_dims({config.lm.hidden_size}));
 -    lm_hidden_output_ = last_lm.tensor;
-+    g->lm_hidden_output = last_lm.tensor;
-     auto last_residual = engine::modules::SliceModule({1, steps - 1, 1})
-                              .build(ctx, residual_hidden);
-     last_residual = engine::core::reshape_tensor(
-         ctx, ensure_contiguous(ctx, last_residual),
-         engine::core::TensorShape::from_dims({config.lm.hidden_size}));
+-    auto last_residual = engine::modules::SliceModule({1, steps - 1, 1})
+-                             .build(ctx, residual_hidden);
+-    last_residual = engine::core::reshape_tensor(
+-        ctx, ensure_contiguous(ctx, last_residual),
+-        engine::core::TensorShape::from_dims({config.lm.hidden_size}));
 -    residual_hidden_output_ = last_residual.tensor;
 -    ggml_set_output(lm_hidden_output_);
 -    ggml_set_output(residual_hidden_output_);
@@ -612,10 +702,31 @@
 -    ggml_build_forward_expand(graph_, residual_hidden_output_);
 -    for (auto *key : base_keys_) {
 -      ggml_build_forward_expand(graph_, key);
--    }
--    for (auto *value : base_values_) {
--      ggml_build_forward_expand(graph_, value);
-+    g->residual_hidden_output = last_residual.tensor;
++    auto last_row = [&](engine::core::TensorValue seq) {
++      // Extract row (real-1) without a baked-in index: multiply by the
++      // per-request one-hot pick vector (uploaded per run) and sum the row
++      // axis. Exact in f32 (x*1 plus zeros).
++      auto pick3 = engine::core::wrap_tensor(
++          ggml_reshape_3d(raw_ctx, g->pick, 1, steps, 1),
++          engine::core::TensorShape::from_dims({1, steps, 1}), GGML_TYPE_F32);
++      auto masked = engine::core::wrap_tensor(
++          ggml_mul(raw_ctx, seq.tensor, pick3.tensor), seq.shape, GGML_TYPE_F32);
++      // ggml_sum_rows sums ne[0]; permute the row axis to the front first.
++      auto perm = engine::core::wrap_tensor(
++          ggml_permute(raw_ctx, masked.tensor, 1, 0, 2, 3),
++          engine::core::TensorShape::from_dims({1, seq.shape.dims[2],
++                                                seq.shape.dims[1]}),
++          GGML_TYPE_F32);
++      auto summed =
++          ggml_sum_rows(raw_ctx, ensure_contiguous(ctx, perm).tensor);
++      auto flat =
++          ggml_reshape_1d(raw_ctx, summed, config.lm.hidden_size);
++      return engine::core::wrap_tensor(
++          flat, engine::core::TensorShape::from_dims({config.lm.hidden_size}),
++          GGML_TYPE_F32);
++    };
++    g->lm_hidden_output = last_row(lm_hidden).tensor;
++    g->residual_hidden_output = last_row(residual_hidden).tensor;
 +    ggml_set_output(g->lm_hidden_output);
 +    ggml_set_output(g->residual_hidden_output);
 +    g->graph = ggml_new_graph_custom(raw_ctx, kDefaultGraphNodes, false);
@@ -627,16 +738,19 @@
 +    for (auto *value : g->base_values) {
 +      ggml_build_forward_expand(g->graph, value);
      }
--    for (auto *key : residual_keys_) {
--      ggml_build_forward_expand(graph_, key);
+-    for (auto *value : base_values_) {
+-      ggml_build_forward_expand(graph_, value);
 +    for (auto *key : g->residual_keys) {
 +      ggml_build_forward_expand(g->graph, key);
      }
--    for (auto *value : residual_values_) {
--      ggml_build_forward_expand(graph_, value);
+-    for (auto *key : residual_keys_) {
+-      ggml_build_forward_expand(graph_, key);
 +    for (auto *value : g->residual_values) {
 +      ggml_build_forward_expand(g->graph, value);
      }
+-    for (auto *value : residual_values_) {
+-      ggml_build_forward_expand(graph_, value);
+-    }
 -    gallocr_ = ggml_gallocr_new(
 +    g->gallocr = ggml_gallocr_new(
          ggml_backend_get_default_buffer_type(weights_->backend()));
@@ -652,7 +766,15 @@
        throw std::runtime_error(
            "failed to allocate VoxCPM2 prompt prefill graph");
      }
-@@ -844,28 +1008,15 @@
++    // Find the compute arena's buffer for the per-request zeroing in run().
++    for (ggml_tensor *t_ = ggml_get_first_tensor(raw_ctx); t_ != nullptr;
++         t_ = ggml_get_next_tensor(raw_ctx, t_)) {
++      if (t_->op != GGML_OP_NONE && t_->buffer != nullptr) {
++        g->arena_buffer = t_->buffer;
++        break;
++      }
++    }
+     std::vector<int32_t> position_ids(static_cast<size_t>(steps), 0);
      for (int64_t i = 0; i < steps; ++i) {
        position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
      }
@@ -660,6 +782,38 @@
 +    ggml_backend_tensor_set(g->positions, position_ids.data(), 0,
                              position_ids.size() * sizeof(int32_t));
 -    sequence_steps_ = steps;
++    // Warm-up compute at build: the very first compute on a fresh graph can
++    // still differ mildly (kernel/pool first-use effects outside the arena);
++    // absorb it here so the first real request matches all later ones.
++    if (g->arena_buffer != nullptr) {
++      ggml_backend_buffer_clear(g->arena_buffer, 0);
++      ggml_backend_tensor_set(g->positions, position_ids.data(), 0,
++                              position_ids.size() * sizeof(int32_t));
++    }
++    {
++      std::vector<float> zeros(
++          static_cast<size_t>(steps * config.lm.hidden_size), 0.0F);
++      std::vector<float> zero_mask(static_cast<size_t>(steps), 0.0F);
++      std::vector<float> zero_pick(static_cast<size_t>(steps), 0.0F);
++      ggml_backend_tensor_set(g->input_embeddings, zeros.data(), 0,
++                              zeros.size() * sizeof(float));
++      ggml_backend_tensor_set(g->current_embeddings, zeros.data(), 0,
++                              zeros.size() * sizeof(float));
++      ggml_backend_tensor_set(g->text_mask, zero_mask.data(), 0,
++                              zero_mask.size() * sizeof(float));
++      ggml_backend_tensor_set(g->audio_mask, zero_mask.data(), 0,
++                              zero_mask.size() * sizeof(float));
++      ggml_backend_tensor_set(g->pick, zero_pick.data(), 0,
++                              zero_pick.size() * sizeof(float));
++      engine::core::set_backend_threads(weights_->backend(),
++                                        weights_->threads());
++      if (engine::core::compute_backend_graph(weights_->backend(), g->graph) !=
++          GGML_STATUS_SUCCESS) {
++        throw std::runtime_error(
++            "VoxCPM2 prompt prefill warm-up compute failed");
++      }
++      ggml_backend_synchronize(weights_->backend());
++    }
 +    return g;
    }
  
@@ -685,7 +839,7 @@
  };
  
  VoxCPM2PromptPrefillRuntime::VoxCPM2PromptPrefillRuntime(
-@@ -994,13 +1145,20 @@
+@@ -994,13 +1255,20 @@
  class VoxCPM2MiniCPMStepRuntime::Impl {
  public:
    Impl(std::shared_ptr<const VoxCPM2WeightsRuntime> weights,
@@ -709,7 +863,7 @@
    }
  
    ~Impl() {
-@@ -1009,13 +1167,39 @@
+@@ -1009,13 +1277,39 @@
  
    void reset() {
      ensure_graph();
@@ -732,8 +886,8 @@
 +
 +  int64_t initial_capacity() const {
 +    return std::min(max_cache_steps_, round_capacity(1));
-+  }
-+
+   }
+ 
 +  void ensure_capacity(int64_t required_steps) {
 +    if (required_steps <= 0) {
 +      throw std::runtime_error(
@@ -747,14 +901,14 @@
 +    if (graph_ == nullptr || want > capacity_) {
 +      build(want);
 +    }
-   }
- 
++  }
++
 +  int64_t capacity() const noexcept { return capacity_; }
 +
    void import_state(const engine::runtime::TransformerKVState &state) {
      ensure_graph();
      step_cache_.import_state(state);
-@@ -1032,7 +1216,7 @@
+@@ -1032,7 +1326,7 @@
      if (static_cast<int64_t>(embedding.size()) != config.hidden_size) {
        throw std::runtime_error("VoxCPM2 MiniCPM step embedding size mismatch");
      }
@@ -763,7 +917,7 @@
        throw std::runtime_error("VoxCPM2 MiniCPM step exceeds cache capacity");
      }
      ggml_backend_tensor_set(input_, embedding.data(), 0,
-@@ -1074,7 +1258,7 @@
+@@ -1074,7 +1368,7 @@
  private:
    void ensure_graph() {
      if (graph_ == nullptr) {
@@ -772,7 +926,7 @@
      }
    }
  
-@@ -1097,17 +1281,17 @@
+@@ -1097,17 +1391,17 @@
      ctx_.reset();
    }
  
@@ -794,7 +948,7 @@
      ctx_.reset(ggml_init(params));
      if (ctx_ == nullptr) {
        throw std::runtime_error(
-@@ -1130,10 +1314,10 @@
+@@ -1130,10 +1424,10 @@
      auto cache_slot = engine::core::wrap_tensor(
          cache_slot_, engine::core::TensorShape::from_dims({1}), GGML_TYPE_I32);
      attention_mask_ =
@@ -807,7 +961,7 @@
          GGML_TYPE_F16);
  
      std::vector<engine::core::TensorValue> cache_keys;
-@@ -1144,18 +1328,23 @@
+@@ -1144,18 +1438,23 @@
        cache_keys.push_back(engine::core::make_tensor(
            ctx, GGML_TYPE_F32,
            engine::core::TensorShape::from_dims(
@@ -835,7 +989,7 @@
      x = engine::modules::RMSNormModule(
              {config.hidden_size, config.rms_norm_eps, true, false})
              .build(ctx, x, lm_weights.norm);
-@@ -1167,13 +1356,18 @@
+@@ -1167,13 +1466,18 @@
      if (buffer_ == nullptr) {
        throw std::runtime_error("failed to allocate VoxCPM2 MiniCPM step graph");
      }
@@ -856,7 +1010,7 @@
    size_t graph_context_bytes_ = 0;
    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
    ggml_tensor *input_ = nullptr;
-@@ -1197,6 +1391,14 @@
+@@ -1197,6 +1501,14 @@
  
  void VoxCPM2MiniCPMStepRuntime::reset() { impl_->reset(); }
  
@@ -1333,7 +1487,15 @@
        } else {
          current_embed = row.embedding;
          if (static_cast<int64_t>(current_embed.size()) != hidden_size) {
-@@ -1582,10 +1812,9 @@
+@@ -1552,7 +1782,6 @@
+     residual_lm_.import_state(prefill_output.residual_state);
+     std::vector<float> lm_hidden = prefill_output.lm_hidden;
+     std::vector<float> residual_hidden = prefill_output.residual_hidden;
+-
+     VoxCPM2Result result;
+     std::vector<const PrefillRow *> context_rows;
+     for (auto it = prefill.rows.rbegin(); it != prefill.rows.rend(); ++it) {
+@@ -1582,14 +1811,13 @@
          streaming_chunks != nullptr || static_cast<bool>(streaming_chunk_callback);
      const int64_t left_ctx = std::max<int64_t>(0, options.stream_left_context);
      for (int64_t index = 0; index < max_tokens; ++index) {
@@ -1347,7 +1509,12 @@
        const auto patch = cfm_.generate_patch(
            mu, prefix_cond, options.num_inference_steps, options.guidance_scale,
            options.seed, patch_noise_start, options.cfm_noise_file);
-@@ -1616,17 +1845,16 @@
+-      patch_noise_start += static_cast<uint64_t>(patch_elems);
++     patch_noise_start += static_cast<uint64_t>(patch_elems);
+       append_patch(result.generated_features, patch, patch_elems);
+       ++result.generated_patches;
+       append_patch(result.decode_features, patch, patch_elems);
+@@ -1616,17 +1844,16 @@
        prefix_cond = patch;
  
        if (index > options.min_tokens &&
