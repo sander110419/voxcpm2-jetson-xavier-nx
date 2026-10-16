@@ -134,9 +134,11 @@ Use `config/voxcpm2_server.json` from this repo (adjust paths). Field-by-field:
 - `"mode": "streaming"` — required for chunked output.
 - `"retry_badcase": false` — **REQUIRED for streaming**; the engine's bad-case retry
   is incompatible with streaming mode and hangs/errors otherwise.
-- `"num_inference_steps": 4` — the diffusion sweet spot, measured on the Xavier:
-  steps=10 is ~2× slower for +0.012 identity; **steps ≤3 silently drops content on
-  paragraphs** (rejected); steps=5 is borderline on identity.
+- `"num_inference_steps": 6` — the production sweet spot, measured on the Xavier:
+  steps=10 is ~2× slower for +0.012 identity; steps=4 is fastest but a whisper
+  round-trip battery flagged 1/10 short clips as garbled; **steps ≤3 silently drops
+  content on paragraphs (rejected)**; steps=6 passed 10/10 clean at ~+35–50 % wall
+  over steps=4.
 - `guidance_scale` — keep the default 2.0. **Measured: guidance 1.0 breaks EOS
   discipline — the model rambles and never stops.**
 - `"voxcpm2.mem_saver": false` — ~2× faster warm (holds all compute graphs resident).

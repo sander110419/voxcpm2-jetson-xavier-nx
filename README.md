@@ -6,15 +6,17 @@ Built on [audio.cpp](https://github.com/0xShug0/audio.cpp) (pure C++/ggml, no Py
 runtime) and [OpenBMB VoxCPM2](https://huggingface.co/openbmb/VoxCPM2).
 
 **Measured on a lived-in Xavier NX (full voice stack resident), before → after this
-patch series, output bit-identical:**
+patch series, with the determinism fix and production `num_inference_steps=6`:**
 
 | metric | stock audio.cpp | + these patches | Δ |
 |---|---|---|---|
-| warm short reply (2.7 s audio) | 5.29 s | **3.28 s** | −38 % |
-| streaming time-to-first-audio | 0.96 s | **0.62 s** | −35 % |
-| paragraph, 15.2 s audio | 25.4 s (RTF 1.67) | **16.6 s (RTF 1.09)** | −35 % |
-| cold start (model load + first request) | ~29 s | **17.5 s** | −40 % |
+| warm short reply (2.7 s audio) | 5.29 s | **3.4 s** | −36 % |
+| streaming time-to-first-audio | 0.96 s | **0.9 s** | −6 % |
+| paragraph, 15.2 s audio | 25.4 s (RTF 1.67) | **21.7 s (RTF 1.33)** | −15 % |
+| cold start (model load + first request) | ~29 s | **~22 s** | −24 % |
 | per-request KV cache allocation | ~605 MB | **19–38 MB** | −94 % |
+| output stability | same text can draw differently after any length change | **byte-stable per text** (adversarial battery) | fixed |
+| 10-clip Dutch content check (whisper round-trip) | 1/10 garbled at steps=4 | **0/10 at steps=6** | clean |
 
 The ~37.6×-RTF CPU lane and the "no LLM-class TTS runs on Xavier" folklore are out of
 date: with the CUDA backend patched to build on JP5 and the decode path fixed, a
@@ -28,8 +30,10 @@ audio in ~0.6 s.
 - `patches/0002-carmel-isa-flags.patch` — hardcode `armv8.2-a+fp16+dotprod`
   (gcc-13 dropped `-mcpu=carmel`; the native probe yields a broken baseline).
 - `patches/0003-voxcpm2-jetson-xavier-performance.patch` — the performance series
-  (details below). Numerically exact: before/after PCM output is bit-identical
-  (same fixed seed), verified with per-sample diff on multiple texts.
+  (details below), including the determinism fix: padded bucketed prefill plus
+  per-request arena zeroing, so the same text produces the same audio on every
+  request (verified with an adversarial battery of fresh/repeat/interleaved
+  lengths, and a 10-clip whisper round-trip content check).
 - `config/voxcpm2_server.json` — production server config (streaming, Q4_K GGUF).
 - `scripts/tts_adapter.py` — stdlib-only streaming HTTP adapter:
   `GET /v1/audio/stream?input=...` → 24 kHz WAV stream, ready to front a voice agent.
